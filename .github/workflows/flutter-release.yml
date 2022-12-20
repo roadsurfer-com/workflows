@@ -1,0 +1,167 @@
+name: Flutter Branch Workflow
+env:
+  ENVIRONMENT_FILE: .env
+
+on:
+  workflow_call:
+    inputs:
+      ios-build-arguments:
+        description: 'any extra arguments such as using sksl or passing a variable using --dart-define etc. for iOS build'
+        type: string
+        required: false
+      android-build-arguments:
+        description: 'any extra arguments such as using sksl or passing a variable using --dart-define etc. for Android build'
+        type: string
+        required: false
+      publish-to-testflight:
+        description: 'Should publish to Testflight?'
+        type: boolean
+        default: true
+
+  workflow_dispatch:
+      
+jobs:
+  generate-build-number:
+    runs-on: [self-hosted]
+    outputs:
+      build-number: ${{ steps.build-number-generator.outputs.build-number }}
+    steps:
+      - name: Generate Build Number
+        id: build-number-generator
+        run: | 
+          build_number=$(date +%s)
+          echo "build-number=$build_number" >> $GITHUB_OUTPUT
+          echo "Build Number: $build_number"
+  lint:
+    runs-on: [self-hosted]
+    needs: [generate-build-number]
+    steps:
+      - uses: roadsurfer-com/actions/checkout-ssh@main
+        with:
+          ssh-private-key: ${{ secrets.CI_SSH_PRIVATE_KEY_FOR_GITHUB_PRIVATE_REPOS }}
+      - uses: roadsurfer-com/actions/setup-flutter@main
+      - run: flutter analyze
+
+  test:
+    runs-on: [self-hosted]
+    needs: [generate-build-number]
+    steps:
+      - uses: roadsurfer-com/actions/checkout-ssh@main
+        with:
+          ssh-private-key: ${{ secrets.CI_SSH_PRIVATE_KEY_FOR_GITHUB_PRIVATE_REPOS }}
+      - uses: roadsurfer-com/actions/setup-flutter@main
+      - run: flutter test --dart-define STAGE=mock
+      
+  android-publish:
+      runs-on: [self-hosted, Linux]
+      needs: [generate-build-number, lint, test]
+      steps:
+        - uses: roadsurfer-com/actions/checkout-ssh@main
+          with:
+            ssh-private-key: ${{ secrets.CI_SSH_PRIVATE_KEY_FOR_GITHUB_PRIVATE_REPOS }}
+        - id: build
+          uses: roadsurfer-com/actions/publish-android@main
+          with:
+            clean: false
+            build-number: ${{ needs.generate-build-number.outputs.build-number }}
+            build-arguments: ${{ inputs.android-build-arguments }}
+            key-store-file-content: ${{ secrets.ANDROID_KEYSTORE_FILE_CONTENT }}
+            key-store-password: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+            signing-key-alias: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+            signing-key-password: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+            github-username: ${{ secrets.GH_USERNAME }}
+            github-token: ${{ secrets.GH_TOKEN }}
+
+  firebase-publish-android:
+      runs-on: [self-hosted, Linux]
+      needs: [android-publish]      
+      steps:
+        - name: Download Artifact (APK)
+          uses: actions/download-artifact@v3
+          with:
+            name: Runner.apk
+            path: .
+        - uses: roadsurfer-com/actions/firebase-publish@main
+          with:
+            app-id: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+            credentials-file: ${{ secrets.FIREBASE_CREDENTIAL_FILE_CONTENT }}
+            file: Runner.apk
+        - uses: geekyeggo/delete-artifact@v2
+          with:
+            name: Runner.apk
+
+  ios-publish:
+      runs-on: [self-hosted, macOS]
+      needs: [generate-build-number, lint, test]
+      outputs:
+        artifact-path: ${{ steps.build-ipa.outputs.artifact-path }}
+      steps:
+        - uses: roadsurfer-com/actions/checkout-ssh@main
+          with:
+            ssh-private-key: ${{ secrets.CI_SSH_PRIVATE_KEY_FOR_GITHUB_PRIVATE_REPOS }}
+        - uses: roadsurfer-com/actions/setup-ios@main
+        - uses: roadsurfer-com/actions/flutter-build@main
+          id: build
+          with:
+            build-type: ipa
+            build-number: ${{ needs.generate-build-number.outputs.build-number }}
+            build-arguments: --no-codesign ${{ inputs.ios-build-arguments }}
+            clean: true
+        - id: build-ipa
+          uses: roadsurfer-com/actions/publish-ios@main
+          with:
+            apple-auth-key-id: ${{ secrets.APPLE_AUTH_KEY_ID }}
+            apple-auth-key-issuer-id: ${{ secrets.APPLE_AUTH_KEY_ISSUER_ID }}
+            apple-auth-key-content: ${{ secrets.APPLE_AUTH_KEY_CONTENT }}
+            apple-auth-key-encoding: "base64"
+            publish-to-testflight: ${{ inputs.publish-to-testflight }}
+            match-password: ${{ secrets.MATCH_PASSWORD }}
+            match-repository: ${{ secrets.MATCH_REPO }}
+            match-apple-id: ${{ secrets.APPLE_ID }}
+            match-apple-team-id: ${{ secrets.APPLE_TEAM_ID }}
+            build-number: ${{ needs.generate-build-number.outputs.build-number }}
+        - name: Zip XCArchive 
+          id: xcarchive
+          shell: bash
+          if: ${{ github.ref_type == 'tag' }}
+          run: |
+            tag=${GITHUB_REF#refs/tags/}
+            tag=${tag//[!0-9.-_]/}
+            xcarchive_name=roadsurfer-spots-$tag.zip
+            zip -r $xcarchive_name ${{ steps.build.outputs.artifact-path }}
+            echo "xcarchive-path=$xcarchive_name" >> $GITHUB_OUTPUT
+        - name: Upload zipped XCArchive
+          if: ${{ github.ref_type == 'tag' }}
+          uses: actions/upload-artifact@v3
+          with:
+            name: ${{ steps.xcarchive.outputs.xcarchive-path }}
+            path: ${{ steps.xcarchive.outputs.xcarchive-path }}
+
+  android-bundle:
+      runs-on: [self-hosted]
+      needs: [generate-build-number, lint, test]
+      if: ${{ github.ref_type == 'tag' }}
+      steps:
+        - uses: roadsurfer-com/actions/checkout-ssh@main
+          with:
+            ssh-private-key: ${{ secrets.CI_SSH_PRIVATE_KEY_FOR_GITHUB_PRIVATE_REPOS }}
+        - uses: roadsurfer-com/actions/setup-android@main
+          with:
+            key-store-file-content: ${{ secrets.ANDROID_KEYSTORE_FILE_CONTENT }}
+            key-store-password: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+            signing-key-alias: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+            signing-key-password: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+            github-username: ${{ secrets.GH_USERNAME }}
+            github-token: ${{ secrets.GH_TOKEN }}
+        - uses: roadsurfer-com/actions/flutter-build@main
+          id: flutter-build
+          with:
+            clean: true
+            build-type: appbundle
+            build-number: ${{ needs.generate-build-number.outputs.build-number }}
+            build-arguments: ${{ inputs.android-build-arguments }}
+        - name: 'Upload AppBundle as artifact'
+          uses: actions/upload-artifact@v3
+          with:
+           name: app-bundle
+           path: ${{ steps.flutter-build.outputs.artifact-path }}
